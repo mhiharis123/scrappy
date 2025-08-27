@@ -67,22 +67,39 @@ async function enhanceWithLLM(scrapedContent, prompt, model) {
     throw new Error('OpenRouter API key is not configured')
   }
   
+  if (!model) {
+    throw new Error('Model is required for LLM enhancement')
+  }
+  
+  if (!scrapedContent?.markdown) {
+    throw new Error('Invalid scraped content - markdown content is missing')
+  }
+  
+  console.log(`[LLM] Starting enhancement with model: ${model}`)
+  console.log(`[LLM] Prompt length: ${prompt.length} characters`)
+  console.log(`[LLM] Content length: ${scrapedContent.markdown.length} characters`)
+  
   const systemPrompt = `You are a web scraping assistant. You will be provided with scraped content from a website and asked to process it according to the user's instructions. Always return well-structured, accurate results based on the provided content.`
   
   const userPrompt = `Here is the scraped content:\n\n${scrapedContent.markdown}\n\nTask: ${prompt}\n\nPlease process this content according to the task and return the result in a clear, structured format.`
   
   try {
+    const requestData = {
+      model: model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      max_tokens: 4000,
+      temperature: 0.1
+    }
+    
+    console.log(`[LLM] Sending request to OpenRouter API...`)
+    const startTime = Date.now()
+    
     const response = await axios.post(
       `${OPENROUTER_BASE_URL}/chat/completions`,
-      {
-        model: model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        max_tokens: 4000,
-        temperature: 0.1
-      },
+      requestData,
       {
         headers: {
           'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
@@ -94,14 +111,52 @@ async function enhanceWithLLM(scrapedContent, prompt, model) {
       }
     )
     
-    return response.data.choices[0].message.content
+    const duration = Date.now() - startTime
+    console.log(`[LLM] Request completed in ${duration}ms`)
+    
+    if (!response.data?.choices?.[0]?.message?.content) {
+      console.error('[LLM] Invalid response structure:', JSON.stringify(response.data, null, 2))
+      throw new Error('Invalid response from OpenRouter API - missing content')
+    }
+    
+    const content = response.data.choices[0].message.content
+    console.log(`[LLM] Response length: ${content.length} characters`)
+    
+    return content
   } catch (error) {
+    console.error('[LLM] Enhancement failed:', error)
+    
     if (error.response) {
-      throw new Error(`OpenRouter API error: ${error.response.data.error?.message || error.response.statusText}`)
+      const status = error.response.status
+      const statusText = error.response.statusText
+      const errorData = error.response.data
+      
+      console.error(`[LLM] HTTP ${status} ${statusText}:`, errorData)
+      
+      if (status === 401) {
+        throw new Error('Authentication failed - check your OpenRouter API key')
+      } else if (status === 402) {
+        throw new Error('Insufficient credits in your OpenRouter account')
+      } else if (status === 429) {
+        throw new Error('Rate limit exceeded - please try again later')
+      } else if (status === 400) {
+        const message = errorData?.error?.message || 'Bad request'
+        throw new Error(`Invalid request to OpenRouter API: ${message}`)
+      } else {
+        const message = errorData?.error?.message || statusText || 'Unknown error'
+        throw new Error(`OpenRouter API error (${status}): ${message}`)
+      }
     } else if (error.request) {
-      throw new Error('OpenRouter API request failed - no response received')
+      console.error('[LLM] No response received:', error.request)
+      throw new Error('OpenRouter API request failed - no response received. Check your internet connection.')
+    } else if (error.code === 'ENOTFOUND') {
+      throw new Error('Cannot reach OpenRouter API - DNS resolution failed')
+    } else if (error.code === 'ECONNREFUSED') {
+      throw new Error('Connection to OpenRouter API refused')
+    } else if (error.code === 'ETIMEDOUT') {
+      throw new Error('Request to OpenRouter API timed out')
     } else {
-      throw new Error(`OpenRouter API error: ${error.message}`)
+      throw new Error(`LLM enhancement error: ${error.message}`)
     }
   }
 }
@@ -315,6 +370,14 @@ app.post('/api/scrape', async (req, res) => {
       })
     }
     
+    // Validate API key is available when LLM is enabled
+    if (useLlm && !OPENROUTER_API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: 'LLM enhancement is not available - OpenRouter API key is not configured'
+      })
+    }
+    
     // Validate pagination parameters
     if (usePagination) {
       if (typeof maxPages !== 'number' || maxPages < 1 || maxPages > 50) {
@@ -325,7 +388,54 @@ app.post('/api/scrape', async (req, res) => {
       }
     }
     
-    // Set default model if LLM is enabled but no model is specified\n    // Use a more robust default model selection\n    let effectiveModel = model;\n    if (useLlm && !effectiveModel) {\n      // Try to get a list of recommended models\n      try {\n        const modelsResponse = await axios.get(`${OPENROUTER_BASE_URL}/models`, {\n          headers: {\n            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,\n            'Content-Type': 'application/json'\n          },\n          timeout: 5000\n        });\n        \n        // Find a well-priced, high-context model\n        const recommendedModels = modelsResponse.data.data\n          .filter(m => \n            !m.id.includes('image') && \n            !m.id.includes('vision') &&\n            m.pricing && \n            m.pricing.prompt && \n            m.pricing.completion &&\n            (m.context_length || 0) >= 4096\n          )\n          .sort((a, b) => {\n            // Prefer less expensive models\n            const aPrice = parseFloat(a.pricing.prompt) + parseFloat(a.pricing.completion);\n            const bPrice = parseFloat(b.pricing.prompt) + parseFloat(b.pricing.completion);\n            return aPrice - bPrice;\n          });\n          \n        if (recommendedModels.length > 0) {\n          effectiveModel = recommendedModels[0].id;\n        } else {\n          // Fallback to a known good model\n          effectiveModel = 'mistralai/mixtral-8x7b-instruct';\n        }\n      } catch (modelError) {\n        // Fallback to a known good model if we can't fetch models\n        effectiveModel = 'mistralai/mixtral-8x7b-instruct';\n        console.warn('Could not fetch models for default selection, using fallback:', effectiveModel);\n      }\n    }\n    \n    // Ensure we have a model if LLM is enabled\n    if (useLlm && !effectiveModel) {\n      effectiveModel = 'mistralai/mixtral-8x7b-instruct';\n    }
+    // Set default model if LLM is enabled but no model is specified
+    // Use a more robust default model selection
+    let effectiveModel = model;
+    if (useLlm && !effectiveModel) {
+      // Try to get a list of recommended models
+      try {
+        const modelsResponse = await axios.get(`${OPENROUTER_BASE_URL}/models`, {
+          headers: {
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 5000
+        });
+        
+        // Find a well-priced, high-context model
+        const recommendedModels = modelsResponse.data.data
+          .filter(m => 
+            !m.id.includes('image') && 
+            !m.id.includes('vision') &&
+            m.pricing && 
+            m.pricing.prompt && 
+            m.pricing.completion &&
+            (m.context_length || 0) >= 4096
+          )
+          .sort((a, b) => {
+            // Prefer less expensive models
+            const aPrice = parseFloat(a.pricing.prompt) + parseFloat(a.pricing.completion);
+            const bPrice = parseFloat(b.pricing.prompt) + parseFloat(b.pricing.completion);
+            return aPrice - bPrice;
+          });
+          
+        if (recommendedModels.length > 0) {
+          effectiveModel = recommendedModels[0].id;
+        } else {
+          // Fallback to a known good model
+          effectiveModel = 'mistralai/mixtral-8x7b-instruct';
+        }
+      } catch (modelError) {
+        // Fallback to a known good model if we can't fetch models
+        effectiveModel = 'mistralai/mixtral-8x7b-instruct';
+        console.warn('Could not fetch models for default selection, using fallback:', effectiveModel);
+      }
+    }
+    
+    // Ensure we have a model if LLM is enabled
+    if (useLlm && !effectiveModel) {
+      effectiveModel = 'mistralai/mixtral-8x7b-instruct';
+    }
     
     // Step 1: Scrape the website
     console.log(`Scraping URL: ${url}${usePagination ? ` with pagination (max ${maxPages} pages)` : ''}`)
@@ -366,15 +476,28 @@ app.post('/api/scrape', async (req, res) => {
           }
         }
       } catch (llmError) {
-        console.error('LLM enhancement failed:', llmError.message)
-        // Return original result with error note
+        console.error('[MAIN] LLM enhancement failed:', llmError.message)
+        console.error('[MAIN] Fallback to original scraping result')
+        
+        // Return original result with detailed error information
         finalResult = {
           success: true,
           data: {
             ...scrapingResult.data,
             json: {
               ...scrapingResult.data.json,
-              llm_enhancement_error: llmError.message
+              llm_enhancement_error: llmError.message,
+              llm_enhancement_attempted: true,
+              model_attempted: effectiveModel,
+              prompt_attempted: prompt
+            },
+            llm_enhancement_failed: true,
+            error_details: {
+              type: 'llm_enhancement_error',
+              message: llmError.message,
+              model: effectiveModel,
+              prompt: prompt,
+              timestamp: new Date().toISOString()
             }
           }
         }
